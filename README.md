@@ -7,7 +7,7 @@ or documents.
 
 Three pieces:
 - **`cc-docs`** — the register and filing command. It lives in [ihsan-sa/autobox](https://github.com/ihsan-sa/autobox)
-  (`core/bin/cc-docs`), not in this repo, so you always get the current one.
+  (`bin/cc-docs`), not in this repo, so you always get the current one.
 - **`pages/`** — the site: three kinds of link (a signed-in reader's own view, a token link you mint for someone
   without an account, and a public link), plus an optional in-browser LaTeX editor.
 - **`bin/library-mirror`** — the publish step. It reads what `cc-docs` has filed and pushes the site's static
@@ -20,7 +20,7 @@ This walks through filing a document and seeing it on the site, entirely on your
 1. **Get `cc-docs`.**
    ```
    git clone https://github.com/ihsan-sa/autobox
-   export PATH="$PWD/autobox/core/bin:$PATH"
+   export PATH="$PWD/autobox/bin:$PATH"
    ```
 2. **File a PDF into a scratch register.**
    ```
@@ -99,6 +99,6 @@ filing and reading documents; wiring them up is a follow-up, not part of this wa
 ## Selfchecks
 
 ```
-CC_DOCS_BIN=/path/to/autobox/core/bin/cc-docs python3 bin/library-mirror selfcheck
+CC_DOCS_BIN=/path/to/autobox/bin/cc-docs python3 bin/library-mirror selfcheck
 node pages/selfcheck.mjs
 ```
