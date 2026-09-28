@@ -1,0 +1,14 @@
+# Cloudflare Pages config. Fill in the placeholders and either commit this (it names no secret — tokens and the
+# Access app id/policy id go in Pages' own "Environment variables" / "Secrets" UI, or .dev.vars for local dev,
+# never here) or pass the same values as `wrangler pages deploy` flags / dashboard settings.
+name = "your-library"                  # the Pages project name (becomes <name>.pages.dev unless you set a custom domain)
+pages_build_output_dir = "pages"
+
+[[d1_databases]]
+binding = "DB"                         # pages/lib/library.js reads this exact name
+database_name = "your-library-db"
+database_id = "REPLACE-WITH-YOUR-D1-DATABASE-ID"   # `wrangler d1 create your-library-db` prints this
+
+# Local dev only (wrangler pages dev reads this file too) — production values live in the Pages dashboard instead.
+[env.local.vars]
+CF_PAGES_BRANCH = "local"

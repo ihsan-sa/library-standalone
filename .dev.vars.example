@@ -1,0 +1,28 @@
+# Copy to .dev.vars (gitignored) for `wrangler pages dev`. Real deployments set the same names as Pages
+# environment variables / secrets in the Cloudflare dashboard instead — this file is local-dev only.
+
+# From `node bin/dev-login.mjs init` (paste its printed ACCESS_JWKS/ACCESS_TEAM/ACCESS_AUD verbatim):
+ACCESS_JWKS=
+ACCESS_TEAM=dev-team
+ACCESS_AUD=dev-aud
+CF_PAGES_BRANCH=local
+
+# Who the site treats as owner — a comma-separated list of emails, and a display name:
+OWNER_EMAILS=owner@example.test
+OWNER_NAME=Owner
+
+# Optional: readers to seed into an empty database on first request (see pages/lib/library.js, SEED_READERS).
+# Leave unset for an empty library — add people through the site once you're signed in as owner.
+# SEED_READERS_JSON=[{"email":"alice@example.test","name":"Alice","projects":["105"],"wid":null}]
+
+# Only needed once you wire up the optional Access-sync feature (pages/lib/library.js pushes group membership
+# changes to your Access policy via the Cloudflare API) — leave unset to skip it, the site works without it:
+# CF_API_TOKEN=
+# CF_ACCOUNT_ID=
+# CF_ACCESS_POLICY_ID=
+# CF_ACCESS_APP_ID=
+
+# Only needed for the feedback/link-mint/reader-export APIs a bearer token gates — leave unset to leave those off:
+# FEEDBACK_TOKENS=
+# LINK_MINT_TOKENS=
+# READER_EXPORT_TOKENS=

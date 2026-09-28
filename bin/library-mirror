@@ -1,0 +1,573 @@
+#!/usr/bin/env python3
+"""library-mirror — every filed document, and the library site's code, pushed to the public repo that Cloudflare
+Pages deploys from.
+
+The repo is what Cloudflare Pages builds the library from, and the copy that survives a dead machine. Its layout:
+    data/register.json          the register (cc-docs), with every public_token taken out, as cc-docs' views do
+    data/files/PPP/<file>.pdf   each filed copy the register names, and no other file under the documents root
+    data/sources/PPP/<N-R>.tar.gz  each revision's kept source (cc-docs file) the register names, the same way;
+                                one over 25 MiB (Pages' file limit) stays local and the pushed register drops
+                                that revision's sources and source_files
+    <everything else>           LIBRARY_MIRROR_PAGES_PREFIX of LIBRARY_MIRROR_SRC at LIBRARY_MIRROR_REF, at the repo root
+Nothing else is ever pushed: not a member-only view, not local config, not a token. The desired tree is built
+from those two sources alone, so a path that leaves them leaves the repo in the next commit.
+
+    library-mirror sync [--dry-run]
+        Commit whatever differs from the repo and push it: one normal commit per change, never a force push. The
+        first run on an empty repo is the backfill. A push that fails (GitHub down, no network) keeps the commit in
+        the local clone and exits 0, so the next run, from a timer or by hand, pushes it; a remote that moved
+        under it gets the same tree committed on top of its head. --dry-run fetches and prints what a sync would
+        push (A/M/D and the path) and writes nothing.
+    library-mirror selfcheck
+        A document filed with the real cc-docs into a scratch root reaches a scratch bare repo; plus the no-op, the
+        remote-down, the pages-at-root and the nothing-else cases. No network, no live state.
+
+Trigger: run `sync` on a timer (cron, systemd, anything that runs once a minute) so a filing or a site change on
+main is on GitHub within a minute or two, and the same tick is the retry after an outage. cc-docs itself is untouched.
+A quiet minute costs a stat per filed copy and a few git calls, and no network: each PDF is hashed once (the cache,
+hashes.json beside the clone, keys its blob by size, mtime and inode). The push uses whatever git credential helper
+is already configured for LIBRARY_MIRROR_REMOTE; this reads no credential itself.
+
+Env: CC_DOCS_ROOT (default ~/.cc/documents) · LIBRARY_MIRROR_DIR the local clone's home (default ~/.cc/library-mirror)
+· LIBRARY_MIRROR_REMOTE the git URL of your Pages-connected repo (required — unset refuses to run, see setup below)
+· LIBRARY_MIRROR_SRC the repo the site's pages/ is read from (default: the directory this script's repo root, i.e.
+the standalone library-export checkout itself) · LIBRARY_MIRROR_PAGES_PREFIX the path under LIBRARY_MIRROR_SRC that
+holds the site (default pages) · LIBRARY_MIRROR_REF (default main) · CC_DOCS_BIN (selfcheck: the cc-docs to file
+with, default: cc-docs on PATH).
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HOME = os.path.expanduser("~")
+BRANCH = "main"
+
+
+def env(k, d):
+    return os.environ.get(k) or d
+
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPO_ROOT = os.path.dirname(HERE)              # this script lives at <repo>/bin/library-mirror
+
+
+def cfg():
+    return {"root": env("CC_DOCS_ROOT", os.path.join(HOME, ".cc", "documents")),
+            "dir": env("LIBRARY_MIRROR_DIR", os.path.join(HOME, ".cc", "library-mirror")),
+            "remote": env("LIBRARY_MIRROR_REMOTE", ""),   # required — no box to default to; see the docstring
+            "src": env("LIBRARY_MIRROR_SRC", REPO_ROOT),
+            "pages_prefix": env("LIBRARY_MIRROR_PAGES_PREFIX", "pages"),
+            "ref": env("LIBRARY_MIRROR_REF", "main")}
+
+
+def git(repo, *args, input=None, check=True):
+    cmd = ["git"] + (["--git-dir", repo] if repo else []) + list(args)
+    p = subprocess.run(cmd, input=input, capture_output=True, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+    if check and p.returncode:
+        raise RuntimeError(f"git {' '.join(args[:2])}: {p.stderr.decode(errors='replace').strip()}")
+    return p
+
+
+def rev(repo, ref):
+    p = git(repo, "rev-parse", "--verify", "-q", ref + "^{commit}", check=False)
+    return p.stdout.decode().strip() if p.returncode == 0 else None
+
+
+PAGES_CAP = 25 << 20       # Cloudflare Pages' limit on one file: a source archive past it is never pushed
+
+
+def desired(c, repo, write):
+    """{path: (mode, blob sha)} of the repo as it should be. write=True puts the blobs into repo's object store."""
+    want = {}
+    with open(os.path.join(c["root"], "register.json")) as f:
+        reg = json.load(f)
+    files = set()
+    for d in reg.get("documents", {}).values():
+        for r in d.get("revisions", []):
+            r.pop("public_token", None)      # brief: "no tokens" — a public link is a capability, the repo is not
+            # only files/PPP/<name> and sources/PPP/<name> the register names: never ws/, never feedback.json,
+            # never a path climbing out of the root
+            src = r.get("sources") or ""
+            try:
+                big = src.startswith("sources/") and os.path.getsize(os.path.join(c["root"], src)) > PAGES_CAP
+            except OSError:
+                big = False
+            if big:
+                # Pages refuses any file over 25 MiB and then fails every later deploy, so an archive past it
+                # stays on the box and the pushed register does not offer it (library-sharing-v2 design, v3 notes)
+                print(f"library-mirror: {src} is over {PAGES_CAP >> 20} MiB; kept on the box, not pushed",
+                      file=sys.stderr)
+                r.pop("sources", None); r.pop("source_files", None)
+                src = ""
+            for fn in (r.get("file") or "", src):
+                parts = fn.split("/")
+                if len(parts) == 3 and parts[0] in ("files", "sources") and ".." not in parts and all(parts):
+                    files.add(fn)
+    body = (json.dumps(reg, indent=1, sort_keys=True) + "\n").encode()
+    hw = ["hash-object"] + (["-w"] if write else [])
+    want["data/register.json"] = ("100644", git(repo, *hw, "--stdin", input=body).stdout.decode().strip())
+    # a regular file that really lives under the root's files/ or sources/: a symlink out (to ~/.cc/config, say) is not sent
+    top = lambda fn: os.path.join(os.path.realpath(c["root"]), fn.split("/")[0]) + os.sep
+    present = [fn for fn in sorted(files) if os.path.isfile(os.path.join(c["root"], fn))
+               and not os.path.islink(os.path.join(c["root"], fn))
+               and os.path.realpath(os.path.join(c["root"], fn)).startswith(top(fn))]
+    for fn in sorted(files - set(present)):
+        print(f"library-mirror: {fn} is in the register but not on disk yet; the next run takes it", file=sys.stderr)
+    # a filed copy is hashed once: the cache keys its blob by size, mtime and inode, so a quiet minute reads no PDF
+    cpath = os.path.join(c["dir"], "hashes.json")
+    try:
+        with open(cpath) as f:
+            cache = json.load(f) if write else {}
+    except (OSError, ValueError):
+        cache = {}
+    stamp = {fn: "%d:%d:%d" % (s.st_size, s.st_mtime_ns, s.st_ino)
+             for fn, s in ((fn, os.stat(os.path.join(c["root"], fn))) for fn in present)}
+    todo = [fn for fn in present if cache.get(fn, [None])[0] != stamp[fn]]
+    if todo:
+        out = git(repo, *hw, "--no-filters", "--stdin-paths",
+                  input="".join(os.path.join(c["root"], fn) + "\n" for fn in todo).encode()).stdout.decode().split()
+        cache.update({fn: [stamp[fn], sha] for fn, sha in zip(todo, out)})
+    for fn in present:
+        want["data/" + fn] = ("100644", cache[fn][1])
+    # the site: LIBRARY_MIRROR_PAGES_PREFIX at the ref, re-rooted. Its blobs are copied across when this run writes.
+    pp = c["pages_prefix"].strip("/") + "/"
+    p = git(None, "-C", c["src"], "ls-tree", "-r", "-z", c["ref"], "--", pp, check=False)
+    if p.returncode:
+        raise RuntimeError(f"cannot read {pp} at {c['ref']} in {c['src']}: {p.stderr.decode().strip()}")
+    for ent in filter(None, p.stdout.split(b"\0")):
+        meta, path = ent.decode().split("\t", 1)
+        mode, typ, sha = meta.split()
+        if typ != "blob":
+            continue
+        dst = path[len(pp):]
+        if dst == "data" or dst.startswith("data/"):
+            raise RuntimeError(f"{pp}{dst} would overwrite the documents at data/; nothing pushed")
+        want[dst] = (mode, sha)
+    if write:
+        # every blob the tree needs must be in the clone: a site blob is copied from the source repo, and a cached
+        # PDF hash whose blob is gone (a pruned clone) is hashed again rather than trusted
+        shas = sorted({s for _, s in want.values()})
+        chk = git(repo, "cat-file", "--batch-check", input="".join(s + "\n" for s in shas).encode()).stdout.decode()
+        missing = {ln.split()[0] for ln in chk.splitlines() if ln.endswith(" missing")}
+        for dst, (mode, sha) in want.items():
+            if sha not in missing:
+                continue
+            if dst.startswith(("data/files/", "data/sources/")):
+                blob = open(os.path.join(c["root"], dst[5:]), "rb").read()
+            else:
+                blob = git(None, "-C", c["src"], "cat-file", "blob", sha).stdout
+            got = git(repo, "hash-object", "-w", "--no-filters", "--stdin", input=blob).stdout.decode().strip()
+            if got != sha:
+                raise RuntimeError(f"{dst} changed while it was read; the next run takes it")
+        tmp = cpath + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({fn: cache[fn] for fn in present}, f)
+        os.replace(tmp, cpath)
+    return want
+
+
+def tree_of(repo, commit):
+    if not commit:
+        return {}
+    out = git(repo, "ls-tree", "-r", "-z", commit).stdout
+    have = {}
+    for ent in filter(None, out.split(b"\0")):
+        meta, path = ent.decode().split("\t", 1)
+        mode, _, sha = meta.split()
+        have[path] = (mode, sha)
+    return have
+
+
+def changes(have, want):
+    return ([("A", p) for p in sorted(set(want) - set(have))] + [("M", p) for p in sorted(set(want) & set(have))
+            if want[p] != have[p]] + [("D", p) for p in sorted(set(have) - set(want))])
+
+
+def ensure(c):
+    repo = os.path.join(c["dir"], "repo.git")
+    if not os.path.isdir(repo):
+        os.makedirs(c["dir"], mode=0o700, exist_ok=True)
+        git(None, "init", "-q", "--bare", repo)
+        git(repo, "remote", "add", "origin", c["remote"])
+    git(repo, "remote", "set-url", "origin", c["remote"])
+    return repo
+
+
+def fetch(repo):
+    p = git(repo, "fetch", "-q", "origin", f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}", check=False)
+    err = p.stderr.decode(errors="replace").strip()
+    if p.returncode and "couldn't find remote ref" in err:
+        return True                          # an empty repo: nothing there yet, the backfill makes the first commit
+    if p.returncode:
+        print(f"library-mirror: fetch failed, working from the last copy: {err}", file=sys.stderr)
+    return p.returncode == 0
+
+
+def commit(repo, want, parent, msg):
+    idx = tempfile.NamedTemporaryFile(dir=os.path.dirname(repo), prefix=".index.", delete=False).name
+    os.unlink(idx)
+    try:
+        e = dict(os.environ, GIT_INDEX_FILE=idx)
+        subprocess.run(["git", "--git-dir", repo, "update-index", "-z", "--index-info"], check=True, env=e,
+                       input="".join(f"{m} {s}\t{p}\0" for p, (m, s) in sorted(want.items())).encode())
+        tree = subprocess.run(["git", "--git-dir", repo, "write-tree"], check=True, env=e,
+                              capture_output=True).stdout.decode().strip()
+    finally:
+        if os.path.exists(idx):
+            os.unlink(idx)
+    ident = ["-c", "user.name=library mirror", "-c", "user.email=library-mirror@invalid.invalid"]
+    args = ident + ["commit-tree", tree, "-m", msg] + (["-p", parent] if parent else [])
+    return git(repo, *args).stdout.decode().strip()
+
+
+def summary(ch):
+    n = {k: sum(1 for x, _ in ch if x == k) for k in "AMD"}
+    docs = sum(1 for _, p in ch if p.startswith(("data/files/", "data/sources/")))
+    site = sum(1 for _, p in ch if not p.startswith("data/"))
+    return (f"library: {n['A']} added, {n['M']} changed, {n['D']} removed "
+            f"({docs} document file{'s' * (docs != 1)}, {site} site file{'s' * (site != 1)})")
+
+
+def sync(c, dry):
+    if dry:
+        with tempfile.TemporaryDirectory() as t:
+            live = os.path.join(c["dir"], "repo.git")
+            repo = live if os.path.isdir(live) else os.path.join(t, "r.git")
+            if repo != live:
+                git(None, "init", "-q", "--bare", repo)
+                git(repo, "remote", "add", "origin", c["remote"])
+            fetch(repo)
+            base = rev(repo, f"refs/remotes/origin/{BRANCH}")
+            ch = changes(tree_of(repo, base), desired(c, repo, write=False))
+            for k, p in ch:
+                print(f"{k}\t{p}")
+            print(f"library-mirror: dry run, {summary(ch)[9:] if ch else 'nothing to push'} "
+                  f"against {c['remote']} {base[:12] if base else '(empty)'}", file=sys.stderr)
+        return 0
+    os.makedirs(c["dir"], mode=0o700, exist_ok=True)
+    with open(os.path.join(c["dir"], ".lock"), "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        repo = ensure(c)
+        want = desired(c, repo, write=True)
+        local, remote = rev(repo, BRANCH), rev(repo, f"refs/remotes/origin/{BRANCH}")
+        if local and local == remote and not changes(tree_of(repo, local), want):
+            return 0                         # in step with the last push and nothing new: no network at all
+        fetch(repo)
+        remote = rev(repo, f"refs/remotes/origin/{BRANCH}")
+        # build on our own unpushed commits when they still sit on the remote's head; else on the remote's head
+        if local and (not remote or git(repo, "merge-base", "--is-ancestor", remote, local, check=False).returncode == 0):
+            base = local
+        else:
+            base = remote
+        ch = changes(tree_of(repo, base), want)
+        head = commit(repo, want, base, summary(ch)) if ch else base
+        if not head:
+            return 0
+        git(repo, "update-ref", f"refs/heads/{BRANCH}", head)
+        if head == remote:
+            return 0
+        for attempt in (1, 2):
+            p = git(repo, "push", "-q", "origin", f"{head}:refs/heads/{BRANCH}", check=False)
+            if p.returncode == 0:
+                git(repo, "update-ref", f"refs/remotes/origin/{BRANCH}", head)
+                print(f"library-mirror: pushed {head[:12]}" + (f" — {summary(ch)}" if ch else ""))
+                return 0
+            err = p.stderr.decode(errors="replace").strip()
+            if attempt == 1 and ("non-fast-forward" in err or "fetch first" in err) and fetch(repo):
+                remote = rev(repo, f"refs/remotes/origin/{BRANCH}")
+                ch = changes(tree_of(repo, remote), want)
+                if not ch:
+                    git(repo, "update-ref", f"refs/heads/{BRANCH}", remote)
+                    return 0
+                head = commit(repo, want, remote, summary(ch))
+                git(repo, "update-ref", f"refs/heads/{BRANCH}", head)
+                continue
+            print(f"library-mirror: push failed, {head[:12]} kept for the next run: {err}", file=sys.stderr)
+            return 0
+    return 0
+
+
+def selfcheck():
+    import shutil
+    here = os.path.dirname(os.path.realpath(__file__))
+    ccdocs = env("CC_DOCS_BIN", "cc-docs")   # on PATH — see README.md for where to get core/bin/cc-docs
+    fails = []
+
+    def ok(cond, what):
+        print(("ok   " if cond else "FAIL ") + what)
+        if not cond:
+            fails.append(what)
+
+    def pdf(path, n):
+        objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d 200] >>" % (100 + n)]
+        out, offs = b"%PDF-1.4\n", []
+        for i, o in enumerate(objs, 1):
+            offs.append(len(out))
+            out += b"%d 0 obj\n" % i + o + b"\nendobj\n"
+        x = len(out)
+        out += b"xref\n0 4\n0000000000 65535 f \n" + b"".join(b"%010d 00000 n \n" % o for o in offs)
+        out += b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % x
+        with open(path, "wb") as f:
+            f.write(out)
+
+    def fixture(t):
+        """A scratch documents root with one document filed by the real cc-docs, a site repo, an empty bare remote."""
+        c = {"root": os.path.join(t, "docs"), "dir": os.path.join(t, "mirror"), "remote": os.path.join(t, "remote.git"),
+             "src": os.path.join(t, "site"), "pages_prefix": "pages", "ref": "main"}
+        pdf(os.path.join(t, "a.pdf"), 1)
+        subprocess.run([ccdocs, "file", os.path.join(t, "a.pdf"), "--project", "scratch", "--kind", "work",
+                        "--title", "Test doc", "--no-stamp"], check=True, capture_output=True,
+                       env=dict(os.environ, CC_DOCS_ROOT=c["root"]))
+        git(None, "init", "-q", "--bare", c["remote"])
+        s = c["src"]
+        git(None, "init", "-q", "-b", "main", s)
+        for p, body in {"pages/index.html": "<h1>library</h1>\n", "pages/functions/api.js": "x\n",
+                        "notes.py": "# not the site\n", "README.md": "private\n"}.items():
+            os.makedirs(os.path.dirname(os.path.join(s, p)), exist_ok=True)
+            with open(os.path.join(s, p), "w") as f:
+                f.write(body)
+        site_commit(s, "site")
+        return c
+
+    def site_commit(s, msg):
+        git(None, "-C", s, "add", "-A")
+        git(None, "-C", s, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg)
+
+    def remote_files(c):
+        return tree_of(c["remote"], rev(c["remote"], BRANCH))
+
+    def blob(c, path):
+        return git(c["remote"], "cat-file", "blob", f"{BRANCH}:{path}").stdout
+
+    def quiet(fn, *a):
+        so, se = sys.stdout, sys.stderr
+        with open(os.devnull, "w") as dn:
+            sys.stdout = sys.stderr = dn
+            try:
+                return fn(*a)
+            finally:
+                sys.stdout, sys.stderr = so, se
+
+    with tempfile.TemporaryDirectory() as T:
+        # 1. a filed document reaches the scratch remote, with the site at the root and nothing else
+        t = os.path.join(T, "1"); os.makedirs(t); c = fixture(t)
+        os.makedirs(os.path.join(c["root"], "ws", "w1", "files", "001"))
+        with open(os.path.join(c["root"], "ws", "w1", "register.json"), "w") as f:
+            f.write("{}")
+        pdf(os.path.join(c["root"], "files", "999-stray.pdf"), 9)
+        with open(os.path.join(t, "secret"), "w") as f:
+            f.write("TOKEN=abc\n")
+        os.symlink(os.path.join(t, "secret"), os.path.join(c["root"], "files", "001", "001-0009-A_link.pdf"))
+        with open(os.path.join(c["root"], "register.json")) as f:
+            r = json.load(f)
+        r["documents"]["001-0009"] = {"number": "001-0009", "project": "001", "title": "link", "revisions": [
+            {"rev": "A", "file": "files/001/001-0009-A_link.pdf"}, {"rev": "B", "file": "files/../../secret"}]}
+        with open(os.path.join(c["root"], "register.json"), "w") as f:
+            json.dump(r, f)
+        quiet(sync, c, False)
+        have = remote_files(c)
+        reg = json.loads(blob(c, "data/register.json"))
+        fn = reg["documents"]["001-0001"]["revisions"][0]["file"]
+        ok("data/" + fn in have and blob(c, "data/" + fn) == open(os.path.join(c["root"], fn), "rb").read(),
+           "the filed PDF is in the remote at data/" + fn)
+        ok(set(have) == {"data/register.json", "data/" + fn, "index.html", "functions/api.js"},
+           "the remote holds the register, its file and pages/ at the root, and nothing else (no ws/, no stray file, "
+           "no symlink or ../ path out of files/): " + ",".join(sorted(have)))
+        ok(len(git(c["remote"], "rev-list", BRANCH).stdout.split()) == 1, "the backfill is one commit")
+
+        # 1b. a revision's kept source goes to data/sources/; the feedback ledger and a ../ sources path never do
+        t = os.path.join(T, "1b"); os.makedirs(t); c = fixture(t)
+        with open(os.path.join(t, "notes.md"), "w") as f:
+            f.write("# notes\n")
+        pdf(os.path.join(t, "b.pdf"), 2)
+        subprocess.run([ccdocs, "file", os.path.join(t, "b.pdf"), "--project", "scratch", "--title", "Sourced doc",
+                        "--source", os.path.join(t, "notes.md"), "--no-stamp"], check=True, capture_output=True,
+                       env=dict(os.environ, CC_DOCS_ROOT=c["root"]))
+        with open(os.path.join(c["root"], "feedback.json"), "w") as f:
+            f.write('{"items": {}}')
+        with open(os.path.join(c["root"], "register.json")) as f:
+            r = json.load(f)
+        r["documents"]["001-0001"]["revisions"][0]["sources"] = "sources/../../secret"
+        with open(os.path.join(c["root"], "register.json"), "w") as f:
+            json.dump(r, f)
+        with open(os.path.join(t, "secret"), "w") as f:
+            f.write("TOKEN=abc\n")
+        quiet(sync, c, False)
+        have = remote_files(c)
+        src = r["documents"]["001-0002"]["revisions"][0].get("sources") or "none"
+        ok(src == "sources/001/001-0002-A.tar.gz" and "data/" + src in have
+           and blob(c, "data/" + src) == open(os.path.join(c["root"], src), "rb").read(),
+           "a kept source is in the remote at data/" + src)
+        ok(not [p for p in have if "feedback" in p or "secret" in p or p.startswith("data/sources/") and p != "data/" + src],
+           "the feedback ledger and a sources path out of sources/ stay on the box: " + ",".join(sorted(have)))
+
+        # 1c. a source archive over Pages' 25 MiB is not pushed and the pushed register does not name it;
+        # one under it, filed beside it, still is
+        t = os.path.join(T, "1c"); os.makedirs(t); c = fixture(t)
+        for name in ("big", "small"):
+            with open(os.path.join(t, name + ".md"), "w") as f:
+                f.write("# " + name + "\n")
+            pdf(os.path.join(t, name + ".pdf"), 3 if name == "big" else 4)
+            subprocess.run([ccdocs, "file", os.path.join(t, name + ".pdf"), "--project", "scratch", "--title", name,
+                            "--source", os.path.join(t, name + ".md"), "--no-stamp"], check=True,
+                           capture_output=True, env=dict(os.environ, CC_DOCS_ROOT=c["root"]))
+        with open(os.path.join(c["root"], "register.json")) as f:
+            r = json.load(f)
+        big = r["documents"]["001-0002"]["revisions"][0]["sources"]
+        small = r["documents"]["001-0003"]["revisions"][0]["sources"]
+        os.chmod(os.path.join(c["root"], big), 0o644)     # cc-docs files it read-only
+        with open(os.path.join(c["root"], big), "r+b") as f:
+            f.truncate(PAGES_CAP + 1)
+        quiet(sync, c, False)
+        have = remote_files(c)
+        pushed = json.loads(blob(c, "data/register.json"))["documents"]
+        ok("data/" + big not in have and "sources" not in pushed["001-0002"]["revisions"][0]
+           and "source_files" not in pushed["001-0002"]["revisions"][0],
+           "a source archive over 25 MiB is not pushed and the pushed register does not name it")
+        ok("data/" + small in have and pushed["001-0003"]["revisions"][0].get("sources") == small,
+           "a source archive under 25 MiB is pushed and named")
+        ok(r["documents"]["001-0002"]["revisions"][0]["sources"] == big
+           and json.load(open(os.path.join(c["root"], "register.json")))["documents"]["001-0002"]["revisions"][0].get("sources") == big,
+           "the live register keeps the big archive's sources field")
+
+        # 2. a public token never leaves the box; a second filing is one more commit on top, not a rewrite
+        t = os.path.join(T, "2"); os.makedirs(t); c = fixture(t)
+        quiet(sync, c, False)
+        first = rev(c["remote"], BRANCH)
+        with open(os.path.join(c["root"], "register.json")) as f:
+            r = json.load(f)
+        r["documents"]["001-0001"]["revisions"][0]["public_token"] = "SECRET-TOKEN-XYZ"
+        with open(os.path.join(c["root"], "register.json"), "w") as f:
+            json.dump(r, f)
+        pdf(os.path.join(t, "b.pdf"), 2)
+        subprocess.run([ccdocs, "file", os.path.join(t, "b.pdf"), "--project", "scratch", "--title", "Second",
+                        "--no-stamp"], check=True, capture_output=True, env=dict(os.environ, CC_DOCS_ROOT=c["root"]))
+        quiet(sync, c, False)
+        second = rev(c["remote"], BRANCH)
+        ok(b"SECRET-TOKEN-XYZ" not in blob(c, "data/register.json")
+           and b"public_token" not in blob(c, "data/register.json"), "the pushed register carries no public_token")
+        ok(b"SECRET-TOKEN-XYZ" in open(os.path.join(c["root"], "register.json"), "rb").read(),
+           "the live register keeps its token (the mirror never writes it)")
+        ok(second != first and git(c["remote"], "rev-parse", f"{second}^").stdout.decode().strip() == first,
+           "the second filing is a new commit whose parent is the first")
+        ok(any(p.startswith("data/files/001/001-0002") for p in remote_files(c)), "the second document is in the remote")
+
+        # 3. nothing changed: no commit
+        t = os.path.join(T, "3"); os.makedirs(t); c = fixture(t)
+        quiet(sync, c, False)
+        first = rev(c["remote"], BRANCH)
+        quiet(sync, c, False)
+        ok(first and rev(c["remote"], BRANCH) == first, "a run with nothing new makes no commit")
+
+        # 4. GitHub down: the filing is kept locally, the run exits 0, and the next run pushes it
+        t = os.path.join(T, "4"); os.makedirs(t); c = fixture(t)
+        quiet(sync, c, False)
+        before = rev(c["remote"], BRANCH)
+        pdf(os.path.join(t, "c.pdf"), 3)
+        subprocess.run([ccdocs, "file", os.path.join(t, "c.pdf"), "--project", "scratch", "--title", "Third",
+                        "--no-stamp"], check=True, capture_output=True, env=dict(os.environ, CC_DOCS_ROOT=c["root"]))
+        down = dict(c, remote=os.path.join(t, "gone.git"))
+        rc = quiet(sync, down, False)
+        ok(rc == 0 and rev(c["remote"], BRANCH) == before, "with the remote unreachable the run exits 0 and pushes nothing")
+        ok(rev(os.path.join(c["dir"], "repo.git"), BRANCH) != before, "…and keeps the new commit locally")
+        quiet(sync, c, False)
+        after = rev(c["remote"], BRANCH)
+        ok(after != before and git(c["remote"], "merge-base", "--is-ancestor", before, after, check=False).returncode == 0
+           and any(p.startswith("data/files/001/001-0002") for p in remote_files(c)),
+           "the next run pushes it as a fast-forward")
+
+        # 5. the site: a file removed from pages/ leaves the root, the documents stay
+        t = os.path.join(T, "5"); os.makedirs(t); c = fixture(t)
+        quiet(sync, c, False)
+        os.unlink(os.path.join(c["src"], "pages", "functions", "api.js"))
+        with open(os.path.join(c["src"], "pages", "index.html"), "w") as f:
+            f.write("<h1>v2</h1>\n")
+        site_commit(c["src"], "v2")
+        quiet(sync, c, False)
+        have = remote_files(c)
+        ok("functions/api.js" not in have and blob(c, "index.html") == b"<h1>v2</h1>\n"
+           and any(p.startswith("data/files/") for p in have), "a site change reaches the root and leaves data/ alone")
+
+        # 6. a remote that moved on is built on, never overwritten by force
+        t = os.path.join(T, "6"); os.makedirs(t); c = fixture(t)
+        quiet(sync, c, False)
+        w = os.path.join(t, "other")
+        git(None, "clone", "-q", c["remote"], w)
+        with open(os.path.join(w, "NOTE"), "w") as f:
+            f.write("x\n")
+        site_commit(w, "someone else")
+        git(None, "-C", w, "push", "-q", "origin", "HEAD:main")
+        theirs = rev(c["remote"], BRANCH)
+        with open(os.path.join(c["src"], "pages", "index.html"), "w") as f:
+            f.write("<h1>v3</h1>\n")
+        site_commit(c["src"], "v3")
+        quiet(sync, c, False)
+        now = rev(c["remote"], BRANCH)
+        ok(now != theirs and git(c["remote"], "merge-base", "--is-ancestor", theirs, now, check=False).returncode == 0
+           and blob(c, "index.html") == b"<h1>v3</h1>\n", "a remote that moved gets the change as a commit on its head")
+
+        # 7. the dry run lists and writes nothing
+        t = os.path.join(T, "7"); os.makedirs(t); c = fixture(t)
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            sync(c, True)
+        lines = buf.getvalue().split("\n")
+        ok("A\tdata/register.json" in lines and "A\tindex.html" in lines and any(l.startswith("A\tdata/files/") for l in lines),
+           "the dry run lists the register, the file and the site as additions")
+        ok(rev(c["remote"], BRANCH) is None and not os.path.exists(os.path.join(c["dir"], "repo.git")),
+           "…and pushes nothing and leaves no clone behind")
+
+        # 8. a site file under pages/data/ would shadow the documents: refused, nothing pushed
+        t = os.path.join(T, "8"); os.makedirs(t); c = fixture(t)
+        os.makedirs(os.path.join(c["src"], "pages", "data"))
+        with open(os.path.join(c["src"], "pages", "data", "register.json"), "w") as f:
+            f.write("{}\n")
+        site_commit(c["src"], "bad")
+        try:
+            quiet(sync, c, False)
+            refused = False
+        except RuntimeError:
+            refused = True
+        ok(refused and rev(c["remote"], BRANCH) is None, "pages/data/ is refused and nothing is pushed")
+        # 9. a clone lost under its hash cache: the cached blobs are hashed again, not trusted, and the push goes
+        t = os.path.join(T, "9"); os.makedirs(t); c = fixture(t)
+        quiet(sync, c, False)
+        cached = os.path.exists(os.path.join(c["dir"], "hashes.json"))
+        shutil.rmtree(os.path.join(c["dir"], "repo.git"))
+        pdf(os.path.join(t, "d.pdf"), 4)
+        subprocess.run([ccdocs, "file", os.path.join(t, "d.pdf"), "--project", "scratch", "--title", "Fourth",
+                        "--no-stamp"], check=True, capture_output=True, env=dict(os.environ, CC_DOCS_ROOT=c["root"]))
+        rc = quiet(sync, c, False)
+        fsck = git(c["remote"], "fsck", "--no-dangling", check=False).returncode
+        ok(cached and rc == 0 and fsck == 0 and len(git(c["remote"], "rev-list", BRANCH).stdout.split()) == 2,
+           "with the clone gone and the cache kept, the next filing still lands whole on top of the first")
+        shutil.rmtree(T, ignore_errors=True)
+    print(f"library-mirror selfcheck: {'FAIL ' + str(len(fails)) if fails else 'ok'}")
+    return 1 if fails else 0
+
+
+def main(argv):
+    if argv[:1] == ["sync"] and argv[1:] in ([], ["--dry-run"]):
+        c = cfg()
+        if not c["remote"]:
+            print("library-mirror: LIBRARY_MIRROR_REMOTE is not set — point it at your git repo's push URL "
+                  "(the one Cloudflare Pages deploys from) and try again", file=sys.stderr)
+            return 1
+        try:
+            return sync(c, argv[1:] == ["--dry-run"])
+        except (RuntimeError, OSError, ValueError) as e:
+            print(f"library-mirror: {e}", file=sys.stderr)
+            return 1
+    if argv == ["selfcheck"]:
+        return selfcheck()
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
